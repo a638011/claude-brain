@@ -12,6 +12,7 @@ Share an artifact with the team by copying it to the shared namespace.
 Usage: /brain-share <type> <name>
 - type: 'skill', 'agent', or 'rule'
 - name: the filename (e.g., 'my-skill.md' or 'important-rule.md')
+- Use `/brain-share --list` to see what's currently shared
 
 Arguments: $ARGUMENTS
 
@@ -23,8 +24,16 @@ Arguments: $ARGUMENTS
    TYPE="${ARGS[0]:-}"
    NAME="${ARGS[1]:-}"
 
+   # Handle --list flag
+   if [ "$TYPE" = "--list" ] || [ "$TYPE" = "list" ]; then
+     echo "Delegating to /brain-shared-list..."
+     # The agent should invoke /brain-shared-list skill instead
+     exit 0
+   fi
+
    if [ -z "$TYPE" ] || [ -z "$NAME" ]; then
      echo "Usage: /brain-share <type> <name>"
+     echo "       /brain-share --list"
      echo "Types: skill, agent, rule"
      echo "Example: /brain-share skill my-useful-tool.md"
      exit 1
@@ -60,7 +69,11 @@ Arguments: $ARGUMENTS
    fi
    ```
 
-3. Copy to shared namespace:
+3. **Ask the user for confirmation** before sharing:
+   "Share $TYPE '$NAME' with all machines in the brain network? This will be visible to all machines that sync with this brain."
+   Wait for user to confirm before proceeding.
+
+4. Copy to shared namespace:
    ```bash
    # Create shared directory structure
    mkdir -p "${BRAIN_REPO}/shared/skills" "${BRAIN_REPO}/shared/agents" "${BRAIN_REPO}/shared/rules"
@@ -86,7 +99,7 @@ Arguments: $ARGUMENTS
    echo "---"
    ```
 
-4. Commit and push:
+5. Commit and push:
    ```bash
    cd "${BRAIN_REPO}"
    git add shared/
@@ -108,7 +121,7 @@ Arguments: $ARGUMENTS
    fi
    ```
 
-5. Show sharing info:
+6. Show sharing info:
    ```bash
    echo ""
    echo "Shared artifact location: shared/$TYPE/$NAME"

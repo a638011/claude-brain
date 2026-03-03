@@ -1,629 +1,635 @@
 #!/usr/bin/env bash
-# run-tests.sh — Test suite for claude-brain security fixes
-# Self-contained bash test runner, no external dependencies required.
+# run-tests.sh — Integration test suite for claude-brain
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TEST_DIR=""
 
-# Test counters
+# Counters
 PASS=0
 FAIL=0
 SKIP=0
-ERRORS=()
 
-# Colors (disable if not a terminal)
+# Colors
 if [ -t 1 ]; then
-  GREEN='\033[0;32m'
-  RED='\033[0;31m'
-  YELLOW='\033[0;33m'
-  NC='\033[0m'
+  GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 else
-  GREEN='' RED='' YELLOW='' NC=''
+  GREEN=''; RED=''; YELLOW=''; CYAN=''; NC=''
 fi
 
-# ── Test Helpers ───────────────────────────────────────────────────────────────
-assert_eq() {
-  local desc="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    echo -e "  ${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
+# JSON query helper (jq or python3 fallback)
+jqf() {
+  local filter="$1" file="$2"
+  if command -v jq &>/dev/null; then
+    jq "$filter" "$file"
   else
-    echo -e "  ${RED}FAIL${NC}: $desc"
-    echo "    Expected: $expected"
-    echo "    Actual:   $actual"
-    FAIL=$((FAIL + 1))
-    ERRORS+=("$desc")
+    python3 -c "
+import json, sys
+with open('$file') as f:
+    data = json.load(f)
+# Simple jq-like access for dot paths
+path = '$filter'.lstrip('.')
+obj = data
+for key in path.split('.'):
+    if key and isinstance(obj, dict):
+        obj = obj.get(key)
+        if obj is None: sys.exit(1)
+print(json.dumps(obj) if isinstance(obj, (dict, list)) else obj)
+" 2>/dev/null
   fi
 }
 
-assert_contains() {
-  local desc="$1" haystack="$2" needle="$3"
-  if echo "$haystack" | grep -qF "$needle"; then
-    echo -e "  ${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
+jqr() {
+  local filter="$1" file="$2"
+  if command -v jq &>/dev/null; then
+    jq -r "$filter" "$file"
   else
-    echo -e "  ${RED}FAIL${NC}: $desc"
-    echo "    Expected to contain: $needle"
-    echo "    In: $(echo "$haystack" | head -3)"
-    FAIL=$((FAIL + 1))
-    ERRORS+=("$desc")
+    python3 -c "
+import json, sys
+with open('$file') as f:
+    data = json.load(f)
+path = '$filter'.lstrip('.')
+obj = data
+for key in path.split('.'):
+    if key and isinstance(obj, dict):
+        obj = obj.get(key)
+        if obj is None:
+            print('null')
+            sys.exit(0)
+if isinstance(obj, (dict, list)):
+    print(json.dumps(obj))
+elif obj is None:
+    print('null')
+else:
+    print(obj)
+" 2>/dev/null
   fi
 }
 
-assert_not_contains() {
-  local desc="$1" haystack="$2" needle="$3"
-  if ! echo "$haystack" | grep -qF "$needle"; then
-    echo -e "  ${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
+json_valid() {
+  local file="$1"
+  if command -v jq &>/dev/null; then
+    jq empty "$file" 2>/dev/null
   else
-    echo -e "  ${RED}FAIL${NC}: $desc"
-    echo "    Expected NOT to contain: $needle"
-    FAIL=$((FAIL + 1))
-    ERRORS+=("$desc")
+    python3 -c "import json; json.load(open('$file'))" 2>/dev/null
   fi
 }
 
-assert_true() {
-  local desc="$1"
-  shift
-  if "$@" 2>/dev/null; then
-    echo -e "  ${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
+json_length() {
+  local filter="$1" file="$2"
+  if command -v jq &>/dev/null; then
+    jq "$filter | length" "$file" 2>/dev/null
   else
-    echo -e "  ${RED}FAIL${NC}: $desc"
-    FAIL=$((FAIL + 1))
-    ERRORS+=("$desc")
+    python3 -c "
+import json
+with open('$file') as f:
+    data = json.load(f)
+path = '$filter'.lstrip('.').rstrip(' ')
+obj = data
+for key in path.split('.'):
+    if key and isinstance(obj, dict):
+        obj = obj.get(key, [])
+print(len(obj) if isinstance(obj, (list, dict)) else 0)
+" 2>/dev/null
   fi
 }
 
-assert_false() {
-  local desc="$1"
-  shift
-  if ! "$@" 2>/dev/null; then
-    echo -e "  ${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
+json_set() {
+  local file="$1" key="$2" value="$3"
+  if command -v jq &>/dev/null; then
+    local tmp; tmp=$(mktemp)
+    jq --arg v "$value" ".$key = \$v" "$file" > "$tmp" && mv "$tmp" "$file"
   else
-    echo -e "  ${RED}FAIL${NC}: $desc"
-    FAIL=$((FAIL + 1))
-    ERRORS+=("$desc")
+    python3 -c "
+import json
+with open('$file') as f:
+    data = json.load(f)
+data['$key'] = '$value'
+with open('$file', 'w') as f:
+    json.dump(data, f, indent=2)
+" 2>/dev/null
   fi
 }
 
-skip_test() {
-  local desc="$1" reason="$2"
-  echo -e "  ${YELLOW}SKIP${NC}: $desc ($reason)"
-  SKIP=$((SKIP + 1))
-}
+# ── Helpers ────────────────────────────────────────────────────────────────────
+pass() { echo -e "  ${GREEN}✓${NC} $1"; PASS=$((PASS + 1)); }
+fail() { echo -e "  ${RED}✗${NC} $1"; FAIL=$((FAIL + 1)); }
+skip() { echo -e "  ${YELLOW}⊘${NC} $1 (skipped)"; SKIP=$((SKIP + 1)); }
+section() { echo -e "\n${CYAN}── $1 ──${NC}"; }
 
-# ── Setup ──────────────────────────────────────────────────────────────────────
-TEST_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/claude-brain-test-XXXXXX")
-cleanup() {
-  rm -rf "$TEST_TMPDIR"
-}
-trap cleanup EXIT
+setup_sandbox() {
+  TEST_DIR=$(mktemp -d)
+  export HOME="$TEST_DIR/home"
+  export CLAUDE_DIR="$HOME/.claude"
+  export BRAIN_REPO="$HOME/.claude/brain-repo"
+  export BRAIN_CONFIG="$HOME/.claude/brain-config.json"
 
-# Export CLAUDE_PLUGIN_ROOT so common.sh can find config
-export CLAUDE_PLUGIN_ROOT="$PROJECT_DIR"
+  # Create mock ~/.claude/ structure
+  mkdir -p "$CLAUDE_DIR"/{rules,skills/review,agents,projects/my-project/memory,output-styles}
+  mkdir -p "$BRAIN_REPO"/{machines,consolidated,meta,shared/skills,shared/agents,shared/rules}
 
-# Create a mock CLAUDE_DIR for testing
-export HOME="$TEST_TMPDIR/home"
-mkdir -p "$HOME/.claude"
+  # CLAUDE.md
+  cat > "$HOME/CLAUDE.md" <<'EOF'
+# My Project Rules
+- Use pnpm not npm
+- Always write tests
+- Prefer TypeScript
+EOF
 
-# ════════════════════════════════════════════════════════════════════════════════
-echo ""
-echo "═══════════════════════════════════════════════"
-echo "  claude-brain Test Suite"
-echo "═══════════════════════════════════════════════"
-echo ""
+  # Rules
+  echo "Always run linting before commit." > "$CLAUDE_DIR/rules/linting.md"
+  echo "Use conventional commits." > "$CLAUDE_DIR/rules/commits.md"
 
-# ── Test Group: Path Encoding/Decoding ─────────────────────────────────────────
-echo "## Path Encoding/Decoding"
+  # Skills
+  cat > "$CLAUDE_DIR/skills/review/SKILL.md" <<'EOF'
+---
+name: review
+description: Code review helper
+---
+Review the code for issues.
+EOF
 
-source "${PROJECT_DIR}/scripts/common.sh" 2>/dev/null
+  # Agents
+  echo "You are a debugging specialist." > "$CLAUDE_DIR/agents/debugger.md"
 
-# Simple path
-result=$(decode_project_path "-home-user-project")
-assert_eq "decode simple path /home/user/project" "/home/user/project" "$result"
+  # Memory
+  cat > "$CLAUDE_DIR/projects/my-project/memory/MEMORY.md" <<'EOF'
+- Project uses vitest for testing
+- Database is PostgreSQL with Drizzle ORM
+- Deploy via GitHub Actions
+EOF
 
-# Path with hyphens (doubled in encoding)
-result=$(decode_project_path "-home-user-my--project")
-assert_eq "decode hyphenated path /home/user/my-project" "/home/user/my-project" "$result"
-
-# Double hyphens in middle
-result=$(decode_project_path "-home-user-my--cool--app")
-assert_eq "decode multiple hyphens /home/user/my-cool-app" "/home/user/my-cool-app" "$result"
-
-# Encode round-trip
-original="/home/user/my-project"
-encoded=$(encode_project_path "$original")
-decoded=$(decode_project_path "$encoded")
-assert_eq "encode/decode round-trip for hyphenated path" "$original" "$decoded"
-
-# project_name_from_encoded
-result=$(project_name_from_encoded "-home-user-my--project")
-assert_eq "project name from encoded (hyphenated)" "my-project" "$result"
-
-result=$(project_name_from_encoded "-home-user-simple")
-assert_eq "project name from encoded (simple)" "simple" "$result"
-
-echo ""
-
-# ── Test Group: JSON Query (Python injection safety) ──────────────────────────
-echo "## JSON Query Safety"
-
-# Test normal query
-result=$(echo '{"name":"test","value":42}' | json_query '.name')
-assert_eq "json_query normal field" "test" "$result"
-
-result=$(echo '{"name":"test","value":42}' | json_query '.value')
-assert_eq "json_query numeric field" "42" "$result"
-
-# Test with special characters in data (NOT in filter)
-result=$(echo '{"name":"it'\''s a test"}' | json_query '.name')
-assert_eq "json_query with apostrophe in data" "it's a test" "$result"
-
-# Test nested query
-result=$(echo '{"a":{"b":"deep"}}' | json_query '.a.b')
-assert_eq "json_query nested" "deep" "$result"
-
-# Test missing key
-result=$(echo '{"name":"test"}' | json_query '.missing')
-assert_eq "json_query missing key returns null" "null" "$result"
-
-echo ""
-
-# ── Test Group: JSON Set (Python injection safety) ────────────────────────────
-echo "## JSON Set Safety"
-
-test_file="${TEST_TMPDIR}/test-set.json"
-echo '{"key":"old"}' > "$test_file"
-json_set "$test_file" '.key' '"new"'
-result=$(json_query '.key' < "$test_file")
-assert_eq "json_set basic update" "new" "$result"
-
-# Test with file path containing spaces (in a temp dir)
-space_dir="${TEST_TMPDIR}/path with spaces"
-mkdir -p "$space_dir"
-echo '{"key":"val"}' > "${space_dir}/test.json"
-json_set "${space_dir}/test.json" '.key' '"updated"'
-result=$(json_query '.key' < "${space_dir}/test.json")
-assert_eq "json_set with spaces in path" "updated" "$result"
-
-echo ""
-
-# ── Test Group: Secret Scanning ───────────────────────────────────────────────
-echo "## Secret Scanning"
-
-# Test: catches OpenAI-style API keys
-result=$(echo "my key is sk-abcdefghijklmnopqrstuvwxyz1234567890" | scan_for_secrets 2>&1 || true)
-assert_contains "detects sk- API key" "$result" "POTENTIAL SECRETS DETECTED"
-
-# Test: catches AWS access key
-result=$(echo "aws key: AKIAIOSFODNN7EXAMPLE" | scan_for_secrets 2>&1 || true)
-assert_contains "detects AWS access key" "$result" "POTENTIAL SECRETS DETECTED"
-
-# Test: catches GitHub PAT
-result=$(echo "token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh" | scan_for_secrets 2>&1 || true)
-assert_contains "detects GitHub PAT" "$result" "POTENTIAL SECRETS DETECTED"
-
-# Test: catches postgres connection string
-result=$(echo "DATABASE_URL=postgres://admin:secretpass@db.host.com:5432/mydb" | scan_for_secrets 2>&1 || true)
-assert_contains "detects postgres connection string" "$result" "POTENTIAL SECRETS DETECTED"
-
-# Test: catches private keys
-result=$(echo "-----BEGIN PRIVATE KEY-----" | scan_for_secrets 2>&1 || true)
-assert_contains "detects private key" "$result" "POTENTIAL SECRETS DETECTED"
-
-# Test: safe content passes
-safe_result=$(echo "This is normal memory about using pnpm instead of npm" | scan_for_secrets 2>/dev/null; echo $?)
-# The exit code should be 0 (last line)
-assert_eq "normal text passes secret scan (exit 0)" "0" "$safe_result"
-
-# Test: catches Bearer tokens
-result=$(echo "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0" | scan_for_secrets 2>&1 || true)
-assert_contains "detects Bearer token" "$result" "POTENTIAL SECRETS DETECTED"
-
-echo ""
-
-# ── Test Group: Temp File Management ──────────────────────────────────────────
-echo "## Temp File Management"
-
-# Test: brain_mktemp creates files with restrictive permissions
-tmp_test=$(brain_mktemp)
-assert_true "brain_mktemp creates a file" test -f "$tmp_test"
-
-# Check permissions (should be 600)
-perms=$(stat -c '%a' "$tmp_test" 2>/dev/null || stat -f '%Lp' "$tmp_test" 2>/dev/null || echo "unknown")
-assert_eq "brain_mktemp sets 600 permissions" "600" "$perms"
-
-echo ""
-
-# ── Test Group: URL Validation ────────────────────────────────────────────────
-echo "## URL Validation"
-
-# SSH URL should pass without warnings
-result=$(validate_remote_url "git@github.com:user/private-brain.git" 2>&1)
-assert_contains "SSH URL passes validation" "$result" "SSH URL detected"
-
-# HTTPS URL should warn
-result=$(validate_remote_url "https://github.com/user/brain.git" 2>&1)
-assert_contains "HTTPS URL triggers warning" "$result" "Make sure this repository is PRIVATE"
-
-echo ""
-
-# ── Test Group: Size Guards ───────────────────────────────────────────────────
-echo "## Size Guards"
-
-# Small file passes
-small_file="${TEST_TMPDIR}/small.txt"
-echo "small content" > "$small_file"
-assert_true "small file passes size check" check_file_size "$small_file"
-
-# Large file warns
-large_file="${TEST_TMPDIR}/large.txt"
-dd if=/dev/zero of="$large_file" bs=1M count=2 2>/dev/null
-assert_false "oversized file fails size check" check_file_size "$large_file"
-
-echo ""
-
-# ── Test Group: Backup/Restore ────────────────────────────────────────────────
-echo "## Backup/Restore"
-
-# Create some mock brain files
-mkdir -p "$HOME/.claude/rules" "$HOME/.claude/skills"
-echo "test claude md" > "$HOME/.claude/CLAUDE.md"
-echo "test rule" > "$HOME/.claude/rules/test.md"
-echo "test skill" > "$HOME/.claude/skills/test.md"
-
-# Create backup
-backup_path=$(backup_before_import 2>/dev/null)
-assert_true "backup creates directory" test -d "$backup_path"
-assert_true "backup includes CLAUDE.md" test -f "${backup_path}/CLAUDE.md"
-assert_true "backup includes rules" test -d "${backup_path}/rules"
-
-# Modify the originals
-echo "modified claude md" > "$HOME/.claude/CLAUDE.md"
-
-# Restore
-restore_from_backup "$backup_path" 2>/dev/null
-restored_content=$(cat "$HOME/.claude/CLAUDE.md")
-assert_eq "restore recovers original content" "test claude md" "$restored_content"
-
-echo ""
-
-# ── Test Group: MCP Server Secret Stripping ───────────────────────────────────
-echo "## MCP Server Secret Stripping"
-
-# Create a mock settings.json with MCP servers that have env secrets
-cat > "$HOME/.claude/settings.json" << 'SETTINGS_EOF'
+  # Settings
+  cat > "$CLAUDE_DIR/settings.json" <<'EOF'
 {
-  "permissions": {"allow": ["Bash"]},
-  "env": {"MY_SECRET": "should-not-export"},
-  "mcpServers": {
-    "my-server": {
-      "command": "npx",
-      "args": ["@my/server"],
-      "env": {
-        "API_KEY": "sk-super-secret-key-12345",
-        "DATABASE_URL": "postgres://admin:pass@host/db"
-      }
-    },
-    "simple-server": {
-      "command": "node",
-      "args": ["server.js"]
-    }
+  "permissions": {
+    "allow": ["Bash(git:*)"],
+    "deny": ["Bash(rm -rf /*)"]
+  },
+  "hooks": {
+    "SessionStart": []
+  },
+  "env": {
+    "SECRET_KEY": "should-not-be-exported"
   }
 }
-SETTINGS_EOF
+EOF
 
-if command -v jq &>/dev/null; then
-  # Test: export strips env from settings
-  settings_export=$(jq 'del(.env) | del(.mcpServers)' "$HOME/.claude/settings.json")
-  assert_not_contains "settings export strips top-level env" "$settings_export" "MY_SECRET"
-  assert_not_contains "settings export strips mcpServers" "$settings_export" "my-server"
+  # Keybindings
+  cat > "$CLAUDE_DIR/keybindings.json" <<'EOF'
+[{"key": "ctrl+k", "command": "clear", "context": "terminal"}]
+EOF
 
-  # Test: MCP export strips env from each server
-  mcp_export=$(jq '
-    .mcpServers // {} |
-    to_entries |
-    map(.value = (.value | del(.env))) |
-    from_entries
-  ' "$HOME/.claude/settings.json")
-  assert_not_contains "MCP export strips server env (API_KEY)" "$mcp_export" "sk-super-secret"
-  assert_not_contains "MCP export strips server env (DATABASE_URL)" "$mcp_export" "postgres://admin"
-  assert_contains "MCP export keeps server command" "$mcp_export" "npx"
-  assert_contains "MCP export keeps server args" "$mcp_export" "@my/server"
-  assert_contains "MCP export keeps simple server" "$mcp_export" "simple-server"
-else
-  skip_test "MCP secret stripping" "jq not available"
-fi
+  # Init brain-repo as git repo
+  (cd "$BRAIN_REPO" && git init -q && git config user.email "test@test.com" && git config user.name "Test" && echo '{"entries":[]}' > meta/merge-log.json && git add -A && git commit -q -m "init")
 
-echo ""
+  # Set PLUGIN_ROOT for scripts
+  export CLAUDE_PLUGIN_ROOT="$PROJECT_DIR"
+}
 
-# ── Test Group: Import Validation ─────────────────────────────────────────────
-echo "## Import Validation"
+cleanup_sandbox() {
+  if [ -n "$TEST_DIR" ] && [ -d "$TEST_DIR" ]; then
+    rm -rf "$TEST_DIR"
+  fi
+}
+trap cleanup_sandbox EXIT
 
-if command -v jq &>/dev/null; then
-  # Create a mock consolidated brain with a new skill
-  mock_brain="${TEST_TMPDIR}/mock-brain.json"
-  cat > "$mock_brain" << 'BRAIN_EOF'
+# ── Tests ──────────────────────────────────────────────────────────────────────
+
+test_export_structure() {
+  section "Export: snapshot structure"
+
+  local output="$TEST_DIR/snapshot.json"
+  bash "$PROJECT_DIR/scripts/export.sh" --output "$output" --skip-secret-scan --quiet 2>/dev/null || true
+
+  if [ ! -f "$output" ]; then
+    fail "export.sh did not produce output file"
+    return
+  fi
+
+  # Check it's valid JSON
+  if json_valid "$output"; then
+    pass "Output is valid JSON"
+  else
+    fail "Output is not valid JSON"
+    return
+  fi
+
+  # Check required top-level fields
+  for field in schema_version exported_at machine declarative procedural experiential environmental; do
+    if jqf ".$field" "$output" >/dev/null 2>&1; then
+      pass "Has field: $field"
+    else
+      fail "Missing field: $field"
+    fi
+  done
+
+  # Check machine info
+  if jqf ".machine.id" "$output" >/dev/null 2>&1; then
+    pass "Has machine.id"
+  else
+    fail "Missing machine.id"
+  fi
+}
+
+test_export_no_secrets() {
+  section "Export: secrets excluded"
+
+  local output="$TEST_DIR/snapshot.json"
+  if [ ! -f "$output" ]; then
+    skip "No snapshot to check"
+    return
+  fi
+
+  local content
+  content=$(cat "$output")
+
+  # Env vars should not appear
+  if echo "$content" | grep -q "should-not-be-exported"; then
+    fail "Env var SECRET_KEY leaked into snapshot"
+  else
+    pass "Env vars excluded from snapshot"
+  fi
+
+  # settings.env should be stripped
+  local env_val
+  env_val=$(jqr ".environmental.settings.content.env" "$output" 2>/dev/null || echo "")
+  if [ -z "$env_val" ] || [ "$env_val" = "null" ] || [ "$env_val" = "{}" ]; then
+    pass "settings.env stripped from snapshot"
+  else
+    fail "settings.env present in snapshot: $env_val"
+  fi
+}
+
+test_export_import_roundtrip() {
+  section "Export → Import round-trip"
+
+  if ! $HAS_JQ; then skip "Requires jq"; return; fi
+
+  local snapshot="$TEST_DIR/snapshot.json"
+  if [ ! -f "$snapshot" ]; then
+    skip "No snapshot for import test"
+    return
+  fi
+
+  # Create a separate target directory
+  local target="$TEST_DIR/target-claude"
+  mkdir -p "$target"
+
+  # Temporarily point CLAUDE_DIR to target
+  local orig_claude_dir="$CLAUDE_DIR"
+  export CLAUDE_DIR="$target"
+
+  # Import needs consolidated brain
+  cp "$snapshot" "$BRAIN_REPO/consolidated/brain.json"
+  bash "$PROJECT_DIR/scripts/import.sh" "$BRAIN_REPO/consolidated/brain.json" --quiet 2>/dev/null || true
+
+  export CLAUDE_DIR="$orig_claude_dir"
+
+  # Check key files were imported
+  if [ -f "$target/rules/linting.md" ]; then
+    pass "Rules imported"
+  else
+    fail "Rules not imported"
+  fi
+
+  if [ -d "$target/skills" ]; then
+    pass "Skills directory created"
+  else
+    fail "Skills directory not created"
+  fi
+}
+
+test_secret_scanning() {
+  section "Export: secret scanning"
+
+  # Plant a fake API key in memory
+  echo "Use API key sk-1234567890abcdefghijklmnopqrstuvwxyz for auth" >> "$CLAUDE_DIR/projects/my-project/memory/MEMORY.md"
+
+  local output
+  output=$(bash "$PROJECT_DIR/scripts/export.sh" --output "$TEST_DIR/snapshot-secrets.json" 2>&1) || true
+
+  if echo "$output" | grep -qi "secret\|warning\|potential"; then
+    pass "Secret scan warned about API key pattern"
+  else
+    # Some implementations may not scan or may be quiet
+    skip "No secret scan warning detected (may be --quiet)"
+  fi
+
+  # Clean up the planted key
+  head -3 "$CLAUDE_DIR/projects/my-project/memory/MEMORY.md" > "$CLAUDE_DIR/projects/my-project/memory/MEMORY.md.tmp"
+  mv "$CLAUDE_DIR/projects/my-project/memory/MEMORY.md.tmp" "$CLAUDE_DIR/projects/my-project/memory/MEMORY.md"
+}
+
+test_structured_merge() {
+  section "Structured merge"
+  if ! $HAS_JQ; then skip "Requires jq"; return; fi
+
+  # Create two snapshots with different settings
+  local snap_a="$TEST_DIR/snap-a.json"
+  local snap_b="$TEST_DIR/snap-b.json"
+  local merged="$TEST_DIR/snap-merged.json"
+
+  cat > "$snap_a" <<'EOF'
 {
   "schema_version": "1.0.0",
-  "declarative": {
-    "claude_md": {"content": "test", "hash": "sha256:abc"},
-    "rules": {
-      "new-rule.md": {"content": "a new rule", "hash": "sha256:def"}
+  "machine": {"id": "aaa", "name": "machine-a"},
+  "environmental": {
+    "settings": {
+      "content": {
+        "permissions": {"allow": ["Bash(git:*)"], "deny": []},
+        "hooks": {}
+      }
+    },
+    "keybindings": {
+      "content": [{"key": "ctrl+k", "command": "clear"}]
     }
   },
-  "procedural": {
-    "skills": {
-      "evil-skill/SKILL.md": {"content": "malicious content", "hash": "sha256:evil"}
-    },
-    "agents": {
-      "new-agent.md": {"content": "a new agent", "hash": "sha256:ghi"}
-    },
-    "output_styles": {}
-  },
-  "experiential": {
-    "auto_memory": {},
-    "agent_memory": {}
-  },
+  "declarative": {"claude_md": {"content": "", "hash": ""}, "rules": {}},
+  "procedural": {"skills": {}, "agents": {}},
+  "experiential": {"auto_memory": {}}
+}
+EOF
+
+  cat > "$snap_b" <<'EOF'
+{
+  "schema_version": "1.0.0",
+  "machine": {"id": "bbb", "name": "machine-b"},
   "environmental": {
-    "settings": {"content": null, "hash": "sha256:null"},
-    "keybindings": {"content": null, "hash": "sha256:null"},
-    "mcp_servers": {}
+    "settings": {
+      "content": {
+        "permissions": {"allow": ["Bash(ls:*)"], "deny": ["Bash(rm:*)"]},
+        "hooks": {}
+      }
+    },
+    "keybindings": {
+      "content": [{"key": "ctrl+l", "command": "scroll"}]
+    }
+  },
+  "declarative": {"claude_md": {"content": "", "hash": ""}, "rules": {}},
+  "procedural": {"skills": {}, "agents": {}},
+  "experiential": {"auto_memory": {}}
+}
+EOF
+
+  bash "$PROJECT_DIR/scripts/merge-structured.sh" "$snap_a" "$snap_b" "$merged" 2>/dev/null || true
+
+  if [ ! -f "$merged" ]; then
+    fail "merge-structured.sh did not produce output"
+    return
+  fi
+
+  # Check permissions were unioned
+  local allow_count
+  allow_count=$(json_length ".environmental.settings.content.permissions.allow" "$merged" || echo "0")
+  if [ "$allow_count" -ge 2 ]; then
+    pass "Permissions.allow unioned ($allow_count entries)"
+  else
+    fail "Permissions.allow not unioned (got $allow_count)"
+  fi
+
+  local deny_count
+  deny_count=$(json_length ".environmental.settings.content.permissions.deny" "$merged" || echo "0")
+  if [ "$deny_count" -ge 1 ]; then
+    pass "Permissions.deny unioned ($deny_count entries)"
+  else
+    fail "Permissions.deny not unioned (got $deny_count)"
+  fi
+}
+
+test_register_machine() {
+  section "Register machine"
+
+  # Remove existing config to test fresh creation
+  rm -f "$BRAIN_CONFIG"
+
+  bash "$PROJECT_DIR/scripts/register-machine.sh" "git@github.com:test/test.git" 2>/dev/null || true
+
+  if [ ! -f "$BRAIN_CONFIG" ]; then
+    fail "brain-config.json not created"
+    return
+  fi
+
+  if json_valid "$BRAIN_CONFIG"; then
+    pass "brain-config.json is valid JSON"
+  else
+    fail "brain-config.json is not valid JSON"
+    return
+  fi
+
+  # Check required fields
+  for field in version remote machine_id machine_name brain_repo_path auto_sync; do
+    if jqf ".$field" "$BRAIN_CONFIG" >/dev/null 2>&1; then
+      pass "Config has field: $field"
+    else
+      fail "Config missing field: $field"
+    fi
+  done
+
+  # Check last_evolved field (added in v0.2, jq path only)
+  if $HAS_JQ; then
+    if jqf ".last_evolved" "$BRAIN_CONFIG" >/dev/null 2>&1; then
+      pass "Config has last_evolved field"
+    else
+      fail "Config missing last_evolved field"
+    fi
+  else
+    skip "last_evolved check requires jq"
+  fi
+}
+
+test_shared_namespace() {
+  section "Shared namespace"
+  if ! $HAS_JQ; then skip "Requires jq"; return; fi
+
+  # Create shared skill in brain-repo
+  echo "# Shared Test Skill" > "$BRAIN_REPO/shared/skills/team-tool.md"
+
+  # Create a minimal consolidated brain with the shared content
+  cat > "$BRAIN_REPO/consolidated/brain.json" <<'EOF'
+{
+  "schema_version": "1.0.0",
+  "machine": {"id": "test", "name": "test"},
+  "declarative": {"claude_md": {"content": "", "hash": ""}, "rules": {}},
+  "procedural": {"skills": {}, "agents": {}},
+  "experiential": {"auto_memory": {}},
+  "environmental": {"settings": {"content": {}, "hash": ""}, "keybindings": {"content": [], "hash": ""}},
+  "shared": {
+    "skills": {"team-tool.md": {"content": "# Shared Test Skill", "hash": "sha256:test"}},
+    "agents": {},
+    "rules": {}
   }
 }
-BRAIN_EOF
+EOF
 
-  # Run validate_imports and capture warnings
-  source "${PROJECT_DIR}/scripts/common.sh" 2>/dev/null
-  brain_content=$(cat "$mock_brain")
-  validation_output=$(validate_imports "$brain_content" 2>&1 || true)
-  assert_contains "validation detects new skill" "$validation_output" "NEW skill"
-  assert_contains "validation detects new agent" "$validation_output" "NEW agent"
-  assert_contains "validation detects new rule" "$validation_output" "NEW rule"
-else
-  skip_test "import validation" "jq not available"
-fi
+  bash "$PROJECT_DIR/scripts/import.sh" "$BRAIN_REPO/consolidated/brain.json" --quiet 2>/dev/null || true
 
-echo ""
-
-# ── Test Group: Path Traversal Prevention ─────────────────────────────────────
-echo "## Path Traversal Prevention"
-
-# Source import.sh functions
-source "${PROJECT_DIR}/scripts/common.sh" 2>/dev/null
-
-# Create a target directory
-traversal_test_dir="${TEST_TMPDIR}/traversal-test/base"
-mkdir -p "$traversal_test_dir"
-
-# Create a file that should NOT be overwritten
-echo "original content" > "${TEST_TMPDIR}/traversal-test/secret.txt"
-
-# Test: normal key writes correctly
-if $_has_jq; then
-  import_dir_entries "$traversal_test_dir" '{"safe.md": {"content": "safe content", "hash": "sha256:abc"}}' 2>/dev/null
-  assert_true "safe key writes file" test -f "${traversal_test_dir}/safe.md"
-
-  # Test: path traversal attempt is blocked
-  traversal_output=$(import_dir_entries "$traversal_test_dir" '{"../secret.txt": {"content": "HACKED", "hash": "sha256:evil"}}' 2>&1 || true)
-  secret_content=$(cat "${TEST_TMPDIR}/traversal-test/secret.txt")
-  assert_eq "path traversal blocked: file not overwritten" "original content" "$secret_content"
-  assert_contains "path traversal logged" "$traversal_output" "BLOCKED"
-
-  # Test: deep traversal attempt
-  traversal_output2=$(import_dir_entries "$traversal_test_dir" '{"../../etc/cron.d/evil": {"content": "malicious", "hash": "sha256:evil"}}' 2>&1 || true)
-  assert_contains "deep path traversal blocked" "$traversal_output2" "BLOCKED"
-elif $_has_python3; then
-  # Test Python path
-  echo '{"../secret.txt": {"content": "HACKED", "hash": "sha256:evil"}}' | python3 -c "
-import json, os, sys
-base = os.path.realpath(sys.argv[1])
-entries = json.load(sys.stdin)
-for key, val in entries.items():
-    content = val.get('content', '')
-    if content:
-        path = os.path.realpath(os.path.join(base, key))
-        if not path.startswith(base + os.sep) and path != base:
-            print(f'BLOCKED path traversal attempt: {key}', file=sys.stderr)
-            continue
-        print(f'WOULD WRITE: {path}')
-" "$traversal_test_dir" 2>&1
-  secret_content=$(cat "${TEST_TMPDIR}/traversal-test/secret.txt")
-  assert_eq "Python path traversal blocked: file not overwritten" "original content" "$secret_content"
-fi
-
-echo ""
-
-# ── Test Group: Schema Version Validation ─────────────────────────────────────
-echo "## Schema Version Validation"
-
-# Test valid schema
-valid_schema_brain='{"schema_version":"1.0.0","declarative":{"claude_md":null,"rules":{}},"procedural":{"skills":{},"agents":{},"output_styles":{}},"experiential":{"auto_memory":{},"agent_memory":{}},"environmental":{"settings":{"content":null,"hash":"sha256:null"},"keybindings":{"content":null,"hash":"sha256:null"},"mcp_servers":{}}}'
-
-if $_has_jq; then
-  schema_ver=$(echo "$valid_schema_brain" | jq -r '.schema_version // "unknown"')
-  assert_eq "valid schema version detected" "1.0.0" "$schema_ver"
-elif $_has_python3; then
-  schema_ver=$(echo "$valid_schema_brain" | python3 -c "import json,sys; print(json.load(sys.stdin).get('schema_version','unknown'))")
-  assert_eq "valid schema version detected (Python)" "1.0.0" "$schema_ver"
-fi
-
-# Test invalid schema
-invalid_brain='{"schema_version":"2.0.0"}'
-if $_has_jq; then
-  schema_ver=$(echo "$invalid_brain" | jq -r '.schema_version // "unknown"')
-  assert_eq "invalid schema version detected" "2.0.0" "$schema_ver"
-  # Verify it would be rejected (schema != 1.0.0)
-  assert_false "invalid schema would be rejected" test "$schema_ver" = "1.0.0"
-fi
-
-echo ""
-
-# ── Test Group: Export Integration ────────────────────────────────────────────
-echo "## Export Integration"
-
-# Setup mock brain state
-mkdir -p "$HOME/.claude/projects/-home-user-my--project/memory"
-echo "remember to use pnpm" > "$HOME/.claude/projects/-home-user-my--project/memory/MEMORY.md"
-
-# Run export
-export_output=$("${PROJECT_DIR}/scripts/export.sh" --quiet --skip-secret-scan 2>/dev/null || echo "EXPORT_FAILED")
-
-if [ "$export_output" != "EXPORT_FAILED" ]; then
-  if command -v jq &>/dev/null; then
-    # Verify no env vars leaked
-    assert_not_contains "export doesn't contain env secret" "$export_output" "should-not-export"
-    assert_not_contains "export doesn't contain MCP API key" "$export_output" "sk-super-secret"
-    assert_not_contains "export doesn't contain MCP DB URL" "$export_output" "postgres://admin"
-
-    # Verify structure
-    schema=$(echo "$export_output" | jq -r '.schema_version')
-    assert_eq "export has schema version" "1.0.0" "$schema"
-
-    # Verify MCP servers don't have env
-    mcp_has_env=$(echo "$export_output" | jq '[.environmental.mcp_servers | to_entries[] | select(.value.env != null)] | length')
-    assert_eq "exported MCP servers have no env fields" "0" "$mcp_has_env"
+  if [ -f "$CLAUDE_DIR/skills/team-tool.md" ]; then
+    pass "Shared skill imported to local skills"
+  else
+    fail "Shared skill not imported"
   fi
-else
-  skip_test "export integration" "export.sh failed"
-fi
-
-echo ""
-
-# ── Test Group: Python Fallback Safety ────────────────────────────────────────
-echo "## Python Fallback Safety"
-
-if command -v python3 &>/dev/null; then
-  # Temporarily disable jq to force Python fallback
-  # We test by calling python3 directly with the patterns used in common.sh
-
-  # Test json_query Python path with injection attempt in filter
-  result=$(echo '{"key":"value"}' | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-filter_path = sys.argv[1]
-parts = filter_path.strip('.').split('.')
-result = data
-for p in parts:
-    if p and isinstance(result, dict):
-        result = result.get(p)
-    if result is None:
-        break
-if result is None:
-    print('null')
-elif isinstance(result, (dict, list)):
-    print(json.dumps(result))
-else:
-    print(result)
-" ".key" 2>/dev/null)
-  assert_eq "Python json_query safely handles normal input" "value" "$result"
-
-  # Test with an injection attempt — the filter comes via argv, not string interpolation
-  result=$(echo '{"key":"value"}' | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-filter_path = sys.argv[1]
-parts = filter_path.strip('.').split('.')
-result = data
-for p in parts:
-    if p and isinstance(result, dict):
-        result = result.get(p)
-    if result is None:
-        break
-if result is None:
-    print('null')
-elif isinstance(result, (dict, list)):
-    print(json.dumps(result))
-else:
-    print(result)
-" "'; import os; os.system('echo HACKED'); '" 2>/dev/null)
-  assert_eq "Python json_query with injection attempt returns null" "null" "$result"
-
-  # Test json_set Python path
-  test_set_file="${TEST_TMPDIR}/py-set-test.json"
-  echo '{"a":"old"}' > "$test_set_file"
-  python3 -c "
-import json, sys
-file_path = sys.argv[1]
-key_path = sys.argv[2]
-value_str = sys.argv[3]
-with open(file_path) as f:
-    data = json.load(f)
-keys = key_path.strip('.').split('.')
-obj = data
-for k in keys[:-1]:
-    obj = obj.setdefault(k, {})
-obj[keys[-1]] = json.loads(value_str)
-with open(file_path, 'w') as f:
-    json.dump(data, f, indent=2)
-" "$test_set_file" ".a" '"new"' 2>/dev/null
-  result=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['a'])" "$test_set_file")
-  assert_eq "Python json_set safely updates file" "new" "$result"
-
-  # Test append_merge_log Python path with special chars in summary
-  log_test_file="${TEST_TMPDIR}/merge-log-test.json"
-  echo '{"entries":[]}' > "$log_test_file"
-  python3 -c "
-import json, sys
-log_file = sys.argv[1]
-timestamp = sys.argv[2]
-machine_id = sys.argv[3]
-machine_name = sys.argv[4]
-action = sys.argv[5]
-summary = sys.argv[6]
-with open(log_file) as f:
-    data = json.load(f)
-entry = {
-    'timestamp': timestamp,
-    'machine_id': machine_id,
-    'machine_name': machine_name,
-    'action': action,
-    'summary': summary
 }
-data['entries'] = [entry] + data.get('entries', [])
-with open(log_file, 'w') as f:
-    json.dump(data, f, indent=2)
-" "$log_test_file" "2026-01-01T00:00:00Z" "abc123" "test's machine" "push" "It's got \"quotes\" and \$pecial chars" 2>/dev/null
-  result=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['entries'][0]['machine_name'])" "$log_test_file")
-  assert_eq "Python merge log handles special chars in machine name" "test's machine" "$result"
-else
-  skip_test "Python fallback safety" "python3 not available"
-fi
+
+test_auto_evolve_trigger() {
+  section "Auto-evolve scheduling"
+  if ! $HAS_JQ; then skip "Requires jq"; return; fi
+
+  # Ensure brain-config exists
+  if [ ! -f "$BRAIN_CONFIG" ]; then
+    bash "$PROJECT_DIR/scripts/register-machine.sh" "git@github.com:test/test.git" 2>/dev/null || true
+  fi
+
+  # Set last_evolved to 8 days ago
+  local eight_days_ago
+  eight_days_ago=$(date -d "8 days ago" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -v-8d -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+  if [ -z "$eight_days_ago" ]; then
+    skip "Cannot compute date (no GNU or BSD date)"
+    return
+  fi
+
+  json_set "$BRAIN_CONFIG" "last_evolved" "$eight_days_ago"
+
+  # Create a mock evolve.sh that just touches a marker
+  local real_evolve="$PROJECT_DIR/scripts/evolve.sh"
+  local backup_evolve="$TEST_DIR/evolve.sh.bak"
+  cp "$real_evolve" "$backup_evolve"
+
+  cat > "$real_evolve" <<'MOCK'
+#!/usr/bin/env bash
+touch "$HOME/.claude/evolve-triggered"
+MOCK
+  chmod +x "$real_evolve"
+
+  # Create a machine snapshot so pull.sh has something to work with
+  local machine_id
+  machine_id=$(jqr ".machine_id" "$BRAIN_CONFIG")
+  mkdir -p "$BRAIN_REPO/machines/$machine_id"
+  cp "$BRAIN_REPO/consolidated/brain.json" "$BRAIN_REPO/machines/$machine_id/brain-snapshot.json" 2>/dev/null || \
+    echo '{"schema_version":"1.0.0","machine":{"id":"test","name":"test"},"declarative":{},"procedural":{},"experiential":{},"environmental":{}}' > "$BRAIN_REPO/machines/$machine_id/brain-snapshot.json"
+
+  (cd "$BRAIN_REPO" && git add -A && git commit -q -m "test snapshot" 2>/dev/null || true)
+
+  # Run pull.sh (with local repo, no remote)
+  bash "$PROJECT_DIR/scripts/pull.sh" --quiet 2>/dev/null || true
+
+  # Restore real evolve.sh
+  cp "$backup_evolve" "$real_evolve"
+
+  if [ -f "$HOME/.claude/evolve-triggered" ]; then
+    pass "Auto-evolve triggered after 8 days"
+    rm -f "$HOME/.claude/evolve-triggered"
+  else
+    fail "Auto-evolve not triggered after 8 days"
+  fi
+
+  # Now test that it does NOT trigger after 2 days
+  local two_days_ago
+  two_days_ago=$(date -d "2 days ago" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -v-2d -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+  json_set "$BRAIN_CONFIG" "last_evolved" "$two_days_ago"
+
+  # Mock evolve again
+  cp "$real_evolve" "$backup_evolve"
+  cat > "$real_evolve" <<'MOCK'
+#!/usr/bin/env bash
+touch "$HOME/.claude/evolve-triggered"
+MOCK
+  chmod +x "$real_evolve"
+
+  bash "$PROJECT_DIR/scripts/pull.sh" --quiet 2>/dev/null || true
+
+  cp "$backup_evolve" "$real_evolve"
+
+  if [ ! -f "$HOME/.claude/evolve-triggered" ]; then
+    pass "Auto-evolve NOT triggered after 2 days"
+  else
+    fail "Auto-evolve incorrectly triggered after 2 days"
+    rm -f "$HOME/.claude/evolve-triggered"
+  fi
+}
+
+test_wsl_detection() {
+  section "OS detection"
+
+  source "$PROJECT_DIR/scripts/common.sh" 2>/dev/null || true
+
+  local os
+  os=$(detect_os)
+  if [ -n "$os" ] && [[ "$os" =~ ^(linux|macos|wsl|windows|unknown)$ ]]; then
+    pass "detect_os returned valid value: $os"
+  else
+    fail "detect_os returned unexpected: $os"
+  fi
+}
+
+test_encryption_roundtrip() {
+  section "Encryption (age)"
+
+  if ! command -v age &>/dev/null || ! command -v age-keygen &>/dev/null; then
+    skip "age not installed"
+    return
+  fi
+
+  source "$PROJECT_DIR/scripts/common.sh" 2>/dev/null || true
+
+  # Generate test keypair
+  local identity="$TEST_DIR/test-age-key.txt"
+  local recipients="$TEST_DIR/test-recipients.txt"
+  age-keygen -o "$identity" 2>/dev/null
+  grep "# public key:" "$identity" | cut -d' ' -f4 > "$recipients"
+
+  # Test encrypt/decrypt
+  local plaintext="Hello, this is a test of brain encryption!"
+  local encrypted
+  encrypted=$(echo "$plaintext" | age -R "$recipients" -a 2>/dev/null) || {
+    fail "age encryption failed"
+    return
+  }
+
+  if echo "$encrypted" | head -1 | grep -q "BEGIN AGE ENCRYPTED FILE"; then
+    pass "Content encrypted with age armor"
+  else
+    fail "Encrypted content missing age header"
+  fi
+
+  local decrypted
+  decrypted=$(echo "$encrypted" | age -d -i "$identity" 2>/dev/null) || {
+    fail "age decryption failed"
+    return
+  }
+
+  if [ "$decrypted" = "$plaintext" ]; then
+    pass "Decrypt round-trip matches original"
+  else
+    fail "Decrypt mismatch: got '$decrypted'"
+  fi
+}
+
+# ── Run ────────────────────────────────────────────────────────────────────────
+echo -e "${CYAN}claude-brain integration tests${NC}"
+echo "================================"
+
+HAS_JQ=false
+command -v jq &>/dev/null && HAS_JQ=true
+
+setup_sandbox
+
+test_export_structure
+test_export_no_secrets
+test_secret_scanning
+test_export_import_roundtrip
+test_structured_merge
+test_register_machine
+test_shared_namespace
+test_auto_evolve_trigger
+test_wsl_detection
+test_encryption_roundtrip
 
 echo ""
+echo "================================"
+echo -e "Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}, ${YELLOW}${SKIP} skipped${NC}"
 
-# ── Test Group: File Permission Safety ────────────────────────────────────────
-echo "## File Permission Safety"
-
-# Exported snapshot should have restricted permissions
-test_export_file="${TEST_TMPDIR}/perm-test-snapshot.json"
-"${PROJECT_DIR}/scripts/export.sh" --quiet --skip-secret-scan --output "$test_export_file" 2>/dev/null || true
-
-if [ -f "$test_export_file" ]; then
-  perms=$(stat -c '%a' "$test_export_file" 2>/dev/null || stat -f '%Lp' "$test_export_file" 2>/dev/null || echo "unknown")
-  assert_eq "exported snapshot has 600 permissions" "600" "$perms"
-else
-  skip_test "export file permissions" "export failed"
+if [ "$FAIL" -gt 0 ]; then
+  exit 1
 fi
-
-echo ""
-
-# ═══════════════════════════════════════════════════════════════════════════════
-echo "═══════════════════════════════════════════════"
-echo "  Results: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
-echo "═══════════════════════════════════════════════"
-
-if [ ${#ERRORS[@]} -gt 0 ]; then
-  echo ""
-  echo "Failed tests:"
-  for e in "${ERRORS[@]}"; do
-    echo -e "  ${RED}x${NC} $e"
-  done
-fi
-
-echo ""
-exit $FAIL

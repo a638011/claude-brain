@@ -109,14 +109,11 @@ if [ ${#unique_hashes[@]} -eq 1 ]; then
   exit 0
 fi
 
-# ── Build merge prompt ─────────────────────────────────────────────────────────
-MERGE_TEMPLATE=$(cat "${PLUGIN_ROOT}/templates/merge-prompt.md")
-
-# Substitute placeholders
-PROMPT=$(echo "$MERGE_TEMPLATE" | sed "s|{{MACHINE_LIST}}|${machine_list}|g")
-
-# Append the actual content
-PROMPT="${PROMPT}${claude_md_sections}${memory_sections}"
+# ── Build merge prompt (use temp file to avoid ARG_MAX limits) ─────────────────
+PROMPT_FILE=$(brain_mktemp)
+sed "s|{{MACHINE_LIST}}|${machine_list}|g" "${PLUGIN_ROOT}/templates/merge-prompt.md" > "$PROMPT_FILE"
+echo "$claude_md_sections" >> "$PROMPT_FILE"
+echo "$memory_sections" >> "$PROMPT_FILE"
 
 # ── JSON Schema for structured output ──────────────────────────────────────────
 SCHEMA='{
@@ -159,7 +156,7 @@ SCHEMA='{
 # ── Call claude -p ─────────────────────────────────────────────────────────────
 log_info "Running semantic merge via claude..."
 
-RESULT=$(claude -p "$PROMPT" \
+RESULT=$(claude -p "$(cat "$PROMPT_FILE")" \
   --output-format json \
   --json-schema "$SCHEMA" \
   --model sonnet \

@@ -1,6 +1,18 @@
 # claude-brain
 
-Sync and evolve your Claude Code brain across machines.
+**Your Claude Code brain follows you everywhere.**
+
+Sync and evolve your Claude Code brain across machines — memory, skills, agents, rules, settings — all of it, intelligently merged.
+
+## How is this different?
+
+| Tool | What it does | What claude-brain adds |
+|------|-------------|----------------------|
+| **claude-mem** | Enhances memory within a single machine | Syncs your *entire brain* across all machines |
+| **chezmoi / dotfiles** | Copies config files | Intelligently *merges* accumulated knowledge — resolves contradictions, deduplicates |
+| **Manual MEMORY.md copy** | Works but loses automatic management | Syncs silently on every session start/end, zero daily effort |
+
+No other tool does cross-machine semantic merge of Claude Code's brain state.
 
 ## Security Notice
 
@@ -62,6 +74,31 @@ Claude Code accumulates knowledge over time: auto-memory, custom agents, skills,
 
 Hooks auto-sync on every session start/end. Your brain follows you.
 
+## See it in action
+
+```bash
+# Machine A (work laptop)
+$ claude
+> /brain-init git@github.com:you/my-brain.git
+✓ Brain exported: 42 memory entries, 3 skills, 5 rules
+✓ Pushed to remote
+
+# Machine B (home desktop)
+$ claude
+> /brain-join git@github.com:you/my-brain.git
+✓ Pulled brain: 42 memory entries, 3 skills, 5 rules
+✓ Merged with local state
+✓ Auto-sync enabled
+
+# Later, on Machine B...
+# Claude learns new patterns, you create a skill
+# Session ends → auto-push
+
+# Next day, Machine A...
+# Session starts → auto-pull
+# All of Machine B's learnings are now here
+```
+
 ## Commands
 
 | Command | Description |
@@ -73,6 +110,7 @@ Hooks auto-sync on every session start/end. Your brain follows you.
 | `/brain-evolve` | Promote stable patterns from memory |
 | `/brain-conflicts` | Review and resolve merge conflicts |
 | `/brain-share <type> <name>` | Share a skill, agent, or rule with the team |
+| `/brain-shared-list` | List all shared artifacts in the network |
 | `/brain-log` | Show sync history |
 
 ## How It Works
@@ -101,6 +139,21 @@ Each machine pushes brain snapshots to a shared Git repo. When a machine pulls, 
 | OAuth tokens | Never | Security |
 | Env vars | Never | Machine-specific |
 | MCP server env fields | Never | May contain API keys |
+
+## API Usage & Costs
+
+claude-brain uses `claude -p` (Sonnet) for semantic merges. Here's what costs money and what doesn't:
+
+| Operation | API Cost | When |
+|-----------|----------|------|
+| Structured merge (settings, keybindings, MCP) | **Free** | Every sync |
+| Semantic merge (memory, CLAUDE.md) | ~$0.01–0.05 | Only when content differs across machines |
+| Auto-evolve | ~$0.02–0.10 | At most once per 7 days |
+| Export / import | **Free** | Every sync |
+
+- **Budget cap**: $0.50 per merge call (configurable in `defaults.json`)
+- **Fallback**: If `claude -p` fails, content is concatenated with markers — no data loss, no cost
+- **Typical monthly cost**: $0.50–2.00 for active multi-machine use
 
 ## Platform Support
 
@@ -204,6 +257,15 @@ claude --plugin-dir ./claude-brain
 |------|-------------|
 | `--skip-secret-scan` | Suppress the automatic secret pattern scan on export |
 | `--quiet` | Suppress informational output |
+
+## Recommended CLAUDE.md Addition
+
+Once brain sync is active, add this to your project's `CLAUDE.md` so Claude Code is aware:
+
+```markdown
+# Brain Sync
+This machine syncs brain state via claude-brain plugin. Do not modify ~/.claude/brain-repo/ directly.
+```
 
 ## License
 
